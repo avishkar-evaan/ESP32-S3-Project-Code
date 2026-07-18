@@ -1,0 +1,206 @@
+/**********************************************************************
+  Filename    : Combination Lock (Silent Typing & Bluetooth BLE)
+  Description : Optimized for Freenove layout. Gate opens via keypad 
+                OR by sending "1234" via LightBlue BLE app.
+**********************************************************************/
+#include <Keypad.h>
+#include "BLEDevice.h" 
+#include "BLEServer.h" 
+#include "BLEUtils.h" 
+#include "BLE2902.h" 
+#include "String.h" 
+
+#define SERVO_PIN 21  // Define the pwm pin
+#define SERVO_CHN 0   // Define the pwm channel
+#define SERVO_FRQ 50  // Define the pwm frequency
+#define SERVO_BIT 12  // Define the pwm precision
+
+#define BUZZER_PIN 17 // Define the buzzer pin
+#define BUZZER_CHN 1  // Separate channel for audio to prevent servo conflicts
+#define BUZZER_BIT 8  
+
+// BLE Global Variables from Freenove Sample
+BLECharacteristic *pCharacteristic; 
+bool deviceConnected = false; 
+char rxload[20]; 
+long lastMsg = 0; 
+
+#define SERVICE_UUID "6E400001-B5A3-F393-E0A9-E50E24DCCA9E" 
+#define CHARACTERISTIC_UUID_RX "6E400002-B5A3-F393-E0A9-E50E24DCCA9E" 
+#define CHARACTERISTIC_UUID_TX "6E400003-B5A3-F393-E0A9-E50E24DCCA9E" 
+
+void servo_set_pin(int pin);
+void servo_set_angle(int angle);
+void buzzer_beep(int frequency, int duration);
+void setupBLE(String BLEName);
+void openGate();
+
+// Freenove breakout board pin configuration
+byte rowPins[4] = {14, 13, 12, 11}; 
+byte colPins[4] = {10,  9,  8, 18}; 
+
+char keys[4][4] = {
+  {'1', '2', '3', 'A'},
+  {'4', '5', '6', 'B'},
+  {'7', '8', '9', 'C'},
+  {'*', '0', '#', 'D'}
+};
+
+Keypad myKeypad = Keypad(makeKeymap(keys), rowPins, colPins, 4, 4);
+char passWord[4] = {'1', '2', '3', '4'}; 
+
+// BLE Server Connection Callbacks
+class MyServerCallbacks : public BLEServerCallbacks { 
+  void onConnect(BLEServer *pServer) { 
+    deviceConnected = true; 
+  }; 
+  void onDisconnect(BLEServer *pServer) { 
+    deviceConnected = false; 
+  } 
+}; 
+
+// BLE Data Received Callbacks
+class MyCallbacks : public BLECharacteristicCallbacks { 
+  void onWrite(BLECharacteristic *pCharacteristic) { 
+    String rxValue = pCharacteristic->getValue(); 
+    if (rxValue.length() > 0) { 
+      for (int i = 0; i < 20; i++) { 
+        rxload[i] = 0; 
+      } 
+      for (int i = 0; i < rxValue.length(); i++) { 
+        rxload[i] = (char)rxValue[i]; 
+      } 
+    } 
+  } 
+}; 
+
+void setup() {
+  Serial.begin(115200); 
+  
+  servo_set_pin(SERVO_PIN);
+  servo_set_angle(0); // Start locked
+  
+  #if ESP_ARDUINO_VERSION >= ESP_ARDUINO_VERSION_VAL(3, 0, 0)
+    // Core 3.0+ configurations handled inline
+  #else
+    ledcSetup(BUZZER_CHN, 2000, BUZZER_BIT);
+    ledcAttachPin(BUZZER_PIN, BUZZER_CHN);
+  #endif
+
+  // Initialize BLE and name the device
+  setupBLE("ESP32S3_SmartLock"); 
+  Serial.println("\nThe device started, pair via Bluetooth or use Keypad!"); 
+}
+
+void loop() {
+  // --- SECTION 1: KEYPAD CONTROL ---
+  static char keyIn[4];     
+  static byte keyInNum = 0; 
+  
+  char keyPressed = myKeypad.getKey();  
+
+  if (keyPressed) {
+    if (keyInNum < 4) {
+      keyIn[keyInNum] = keyPressed;
+      keyInNum++;
+    }
+
+    if (keyInNum == 4) {
+      bool isRight = true;
+      for (int i = 0; i < 4; i++) {
+        if (keyIn[i] != passWord[i]) {
+          isRight = false;
+        }
+      }
+
+      if (isRight) {
+        Serial.println("passWord right! (Keypad)");
+        openGate();           
+      }
+      else {
+        Serial.println("passWord error! (Keypad)");
+        buzzer_beep(800, 800); 
+      }
+      
+      keyInNum = 0; 
+      memset(keyIn, 0, sizeof(keyIn));
+    }
+  }
+
+  // --- SECTION 2: BLUETOOTH CONTROL ---
+  long now = millis(); 
+  if (now - lastMsg > 100) { 
+    if (deviceConnected && strlen(rxload) > 0) { 
+      Serial.print("Received via BLE: ");
+      Serial.println(rxload);
+
+      // Check if received text matches "1234" (4 characters long)
+      if (strncmp(rxload, "1234", 4) == 0) { 
+        Serial.println("passWord right! (Bluetooth)");
+        openGate();
+      } 
+      else {
+        Serial.println("passWord error! (Bluetooth)");
+        buzzer_beep(800, 800);
+      }
+      
+      // Clear the BLE buffer array immediately
+      memset(rxload, 0, sizeof(rxload)); 
+    } 
+    lastMsg = now; 
+  } 
+}
+
+// Separate reusable helper to run the servo gate sequence smoothly
+void openGate() {
+  servo_set_angle(180);           
+  delay(4000);                   
+  servo_set_angle(0);   
+}
+
+void setupBLE(String BLEName) { 
+  const char *ble_name = BLEName.c_str(); 
+  BLEDevice::init(ble_name); 
+ 
+  BLEServer *pServer = BLEDevice::createServer(); 
+  pServer->setCallbacks(new MyServerCallbacks()); 
+  BLEService *pService = pServer->createService(SERVICE_UUID); 
+  
+  pCharacteristic = pService->createCharacteristic(CHARACTERISTIC_UUID_TX, BLECharacteristic::PROPERTY_NOTIFY); 
+  pCharacteristic->addDescriptor(new BLE2902()); 
+  
+  BLECharacteristic *pRxCharacteristic = pService->createCharacteristic(CHARACTERISTIC_UUID_RX, BLECharacteristic::PROPERTY_WRITE); 
+  pRxCharacteristic->setCallbacks(new MyCallbacks()); 
+  
+  pService->start(); 
+  pServer->getAdvertising()->start(); 
+  Serial.println("Waiting a client connection to notify..."); 
+} 
+
+void buzzer_beep(int frequency, int duration) {
+  #if ESP_ARDUINO_VERSION >= ESP_ARDUINO_VERSION_VAL(3, 0, 0)
+    ledcAttach(BUZZER_PIN, frequency, BUZZER_BIT);
+    ledcWrite(BUZZER_PIN, 127); 
+    delay(duration);
+    ledcWrite(BUZZER_PIN, 0);   
+    ledcDetach(BUZZER_PIN);
+  #else
+    ledcWriteTone(BUZZER_CHN, frequency);
+    delay(duration);
+    ledcWriteTone(BUZZER_CHN, 0);
+  #endif
+}
+
+void servo_set_pin(int pin) {
+  #if ESP_ARDUINO_VERSION >= ESP_ARDUINO_VERSION_VAL(3, 0, 0)
+    ledcAttach(pin, SERVO_FRQ, SERVO_BIT); 
+  #else
+    ledcAttachChannel(pin, SERVO_FRQ, SERVO_BIT, SERVO_CHN);
+  #endif
+}
+
+void servo_set_angle(int angle) {
+  if (angle > 180 || angle < 0) return;
+  long pwm_value = map(angle, 0, 180, 102, 512);
+  ledcWrite(SERVO_PIN, pwm_value);
+}
